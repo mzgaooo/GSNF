@@ -2,7 +2,7 @@
 
 This is a PyTorch implementation of the paper: [One-Step Graph-Structured Neural Flows for Irregular Multivariate Time Series Classification ](https://arxiv.org/abs/2605.10179)published in ICML2026.
 
-![image-20260806214558250](C:\Users\0.0\AppData\Roaming\Typora\typora-user-images\image-20260806214558250.png)
+![image-20260806214558250](..\GSNF\model\image-20260806214558250.png)
 
 ## Requirements
 
