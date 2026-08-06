@@ -1,0 +1,12 @@
+name: gsnf
+channels:
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch=1.12.1
+  - cudatoolkit=11.3
+  - numpy
+  - scikit-learn
+  - scipy
+  - pip
