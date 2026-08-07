@@ -4,11 +4,7 @@ import torch.nn.functional as F
 
 def compute_binary_CE_loss(
         label_predictions,
-        mortality_label,
-        pos_weight=0.0,
-        label_smoothing=0.0,
-        focal_gamma=0.0):
-    """Binary classification objective for the mortality head."""
+        mortality_label):
     labels = mortality_label.reshape(-1)
     logits = label_predictions
     if logits.dim() == 1:
@@ -21,22 +17,7 @@ def compute_binary_CE_loss(
         return label_predictions.new_zeros(())
     labels = labels.unsqueeze(0).expand_as(logits)
 
-    if label_smoothing > 0.0:
-        smooth = float(label_smoothing)
-        labels = labels * (1.0 - smooth) + 0.5 * smooth
-
-    weight = None
-    if pos_weight is not None and float(pos_weight) > 0.0:
-        weight = label_predictions.new_tensor([float(pos_weight)])
-
-    loss = F.binary_cross_entropy_with_logits(
-        logits, labels, pos_weight=weight, reduction="none")
-    if focal_gamma > 0.0:
-        probability = torch.sigmoid(logits)
-        true_probability = (
-            probability * labels + (1.0 - probability) * (1.0 - labels))
-        loss = loss * (1.0 - true_probability).pow(float(focal_gamma))
-    return loss.mean()
+    return F.binary_cross_entropy_with_logits(logits, labels)
 
 
 def log_normal_pdf(x, mean, logvar, mask):

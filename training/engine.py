@@ -7,7 +7,7 @@ import torch
 from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader
 
-from model.gsnf_biclass import ContextAdapter
+from model.gsnf_biclass import Classifier
 from model.model_factory import ModelFactory
 from training.data import PreparedSplit, collate_prepared
 
@@ -27,37 +27,52 @@ def _move_batch(batch, device):
     }
 
 
-def _binary_metrics(labels, logits):
-    scores = 1.0 / (1.0 + np.exp(-np.clip(logits, -40.0, 40.0)))
+def _metrics(labels, scores):
     return {
         "auroc": float(roc_auc_score(labels, scores)),
         "auprc": float(average_precision_score(labels, scores)),
     }
 
 
-def _collect_predictions(model, loader, device, k_iwae):
+def _loader(dataset, batch_size, shuffle):
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_prepared,
+        num_workers=0,
+    )
+
+
+def _collect(model, loader, device):
     model.eval()
-    logits, z0, summaries, labels = [], [], [], []
+    latent = []
+    summary = []
+    labels = []
     with torch.no_grad():
         for batch in loader:
             batch = _move_batch(batch, device)
             result = model.run_validation(batch)
-            pred = result["label_predictions"]
-            latent = result["z0_features"]
-            if pred.dim() > 1:
-                pred = pred.mean(dim=0)
-            if latent.dim() > 2:
-                latent = latent.mean(dim=0)
-            logits.append(pred.reshape(-1).cpu().numpy())
-            z0.append(latent.reshape(latent.size(0), -1).cpu().numpy())
-            summaries.append(batch["clinical_summary"].cpu().numpy())
+            value = result["z0_features"]
+            if value.dim() > 2:
+                value = value.mean(dim=0)
+            latent.append(value.reshape(value.size(0), -1).cpu().numpy())
+            summary.append(batch["clinical_summary"].cpu().numpy())
             labels.append(batch["truth"].reshape(-1).cpu().numpy())
     return {
-        "logits": np.concatenate(logits),
-        "z0": np.concatenate(z0),
-        "summary": np.concatenate(summaries),
+        "latent": np.concatenate(latent),
+        "summary": np.concatenate(summary),
         "labels": np.concatenate(labels).astype(np.int64),
     }
+
+
+def _validate_splits(train, validation):
+    if train.variable_num != validation.variable_num:
+        raise ValueError("training and validation variable dimensions differ")
+    if train.static_dim != validation.static_dim:
+        raise ValueError("training and validation static dimensions differ")
+    if train.summary.shape[1] != validation.summary.shape[1]:
+        raise ValueError("training and validation summary dimensions differ")
 
 
 def run(config, data_root, device):
@@ -65,83 +80,81 @@ def run(config, data_root, device):
     config.device = str(device)
     train_set = PreparedSplit(Path(data_root) / "train.npz")
     validation_set = PreparedSplit(Path(data_root) / "validation.npz")
-    test_set = PreparedSplit(Path(data_root) / "test.npz")
-    loaders = {
-        "train": DataLoader(
-            train_set,
-            batch_size=config.batch_size,
-            shuffle=True,
-            collate_fn=collate_prepared,
-            num_workers=0,
-        ),
-        "validation": DataLoader(
-            validation_set,
-            batch_size=config.batch_size,
-            shuffle=False,
-            collate_fn=collate_prepared,
-            num_workers=0,
-        ),
-        "test": DataLoader(
-            test_set,
-            batch_size=config.batch_size,
-            shuffle=False,
-            collate_fn=collate_prepared,
-            num_workers=0,
-        ),
-    }
-
+    _validate_splits(train_set, validation_set)
+    config.variable_num = train_set.variable_num
+    config.latent_dim = train_set.variable_num
+    config.graph_num_nodes = train_set.variable_num
+    config.static_dim = train_set.static_dim
+    train_loader = _loader(train_set, config.batch_size, True)
+    train_eval_loader = _loader(train_set, config.batch_size, False)
+    validation_loader = _loader(validation_set, config.batch_size, False)
     model = ModelFactory(config).initialize_biclass_model().to(device)
-    positive_rate = float(np.mean(train_set.labels))
-    model.init_classifier_bias(positive_rate)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=config.lr_scheduler_step,
+        gamma=config.lr_decay,
+    )
     best_state = copy.deepcopy(model.state_dict())
     best_epoch = 0
     best_value = (-float("inf"), -float("inf"))
     for epoch in range(1, config.epochs + 1):
         model.train()
-        for raw_batch in loaders["train"]:
+        for raw_batch in train_loader:
             batch = _move_batch(raw_batch, device)
             optimizer.zero_grad(set_to_none=True)
             result = model.compute_prediction_results(batch, config.k_iwae)
             result["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-
-        validation = _collect_predictions(model, loaders["validation"], device, config.k_iwae)
-        validation_metrics = _binary_metrics(
-            validation["labels"], validation["logits"])
-        candidate_value = (
-            validation_metrics["auprc"], validation_metrics["auroc"])
-        if candidate_value > best_value:
-            best_value = candidate_value
+        model.eval()
+        logits = []
+        labels = []
+        with torch.no_grad():
+            for raw_batch in validation_loader:
+                batch = _move_batch(raw_batch, device)
+                result = model.run_validation(batch)
+                value = result["label_predictions"]
+                if value.dim() > 1:
+                    value = value.mean(dim=0)
+                logits.append(value.reshape(-1).cpu().numpy())
+                labels.append(batch["truth"].reshape(-1).cpu().numpy())
+        logits = np.concatenate(logits)
+        labels = np.concatenate(labels).astype(np.int64)
+        probability = 1.0 / (1.0 + np.exp(-np.clip(logits, -40.0, 40.0)))
+        value = _metrics(labels, probability)
+        candidate = (value["auprc"], value["auroc"])
+        if candidate > best_value:
+            best_value = candidate
             best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
-
+        scheduler.step()
     model.load_state_dict(best_state)
-    train_pred = _collect_predictions(model, loaders["train"], device, config.k_iwae)
-    validation_pred = _collect_predictions(
-        model, loaders["validation"], device, config.k_iwae)
-    adapter = ContextAdapter.fit(
-        train_pred["summary"], train_pred["logits"], train_pred["labels"],
-        validation_pred["summary"], validation_pred["logits"], validation_pred["labels"],
+    train_values = _collect(model, train_eval_loader, device)
+    validation_values = _collect(model, validation_loader, device)
+    classifier = Classifier.fit(
+        train_values["summary"],
+        train_values["latent"],
+        train_values["labels"],
+        validation_values["summary"],
+        validation_values["latent"],
+        validation_values["labels"],
         config.seed,
     )
-    test_pred = _collect_predictions(model, loaders["test"], device, config.k_iwae)
-    final_score = adapter.predict(test_pred["summary"], test_pred["logits"])
-    test_metrics = {
-        "auroc": float(roc_auc_score(test_pred["labels"], final_score)),
-        "auprc": float(average_precision_score(test_pred["labels"], final_score)),
-    }
-
-    result = {
+    test_set = PreparedSplit(Path(data_root) / "test.npz")
+    _validate_splits(train_set, test_set)
+    test_values = _collect(
+        model,
+        _loader(test_set, config.batch_size, False),
+        device,
+    )
+    scores = classifier.predict(test_values["summary"], test_values["latent"])
+    return {
         "seed": int(config.seed),
-        "best_epoch": best_epoch,
-        "selection_metric": "validation_auprc",
-        "test": test_metrics,
+        "best_epoch": int(best_epoch),
+        "test": _metrics(test_values["labels"], scores),
     }
-    return result

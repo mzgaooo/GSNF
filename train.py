@@ -8,10 +8,13 @@ from training.engine import run
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train the focused GSNF release.")
-    parser.add_argument("--data-root", required=True, help="Directory containing train.npz, validation.npz and test.npz")
-    parser.add_argument("--config", default="config/default.json")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", required=True)
+    parser.add_argument("--config", default=None)
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)

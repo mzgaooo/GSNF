@@ -8,11 +8,11 @@ class GNNFlow(nn.Module):
                  time_hidden_dim, **kwargs):
         super().__init__()
         if time_net != "TimeFourier":
-            raise ValueError("the focused release uses TimeFourier conditioning")
+            raise ValueError("time_net must be TimeFourier")
         if kwargs.get("gnn_conv", "basic") != "basic":
-            raise ValueError("the focused release uses basic graph propagation")
+            raise ValueError("gnn_conv must be basic")
         if kwargs.get("graph_direction", "col") != "col":
-            raise ValueError("the focused release uses column propagation")
+            raise ValueError("graph_direction must be col")
         self.nodes = int(nodes)
         self.layers = nn.ModuleList([
             GCNFlowNF(

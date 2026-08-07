@@ -5,19 +5,65 @@ import torch
 from torch.utils.data import Dataset
 
 
+def _features(values, masks, times, static):
+    mask = masks > 0
+    observed = np.where(mask, values, 0.0)
+    count = mask.sum(axis=0).astype(np.float64)
+    denominator = np.maximum(count, 1.0)
+    mean = observed.sum(axis=0) / denominator
+    centered = np.where(mask, values - mean[None, :], 0.0)
+    sample_denominator = np.maximum(count - 1.0, 1.0)
+    std = np.sqrt((centered ** 2).sum(axis=0) / sample_denominator)
+    std[count < 2] = np.nan
+    minimum = np.where(mask, values, np.inf).min(axis=0)
+    maximum = np.where(mask, values, -np.inf).max(axis=0)
+    first_indices = mask.argmax(axis=0)
+    last_indices = mask.shape[0] - 1 - mask[::-1].argmax(axis=0)
+    variable_indices = np.arange(mask.shape[1])
+    first = values[first_indices, variable_indices].astype(np.float64)
+    last = values[last_indices, variable_indices].astype(np.float64)
+    first_time = times[first_indices].astype(np.float64)
+    last_time = times[last_indices].astype(np.float64)
+    absent = count == 0
+    for value in (minimum, maximum, first, last, first_time, last_time):
+        value[absent] = np.nan
+    mean_time = (times[:, None] * mask).sum(axis=0) / denominator
+    centered_time = times[:, None] - mean_time[None, :]
+    slope_denominator = (centered_time ** 2 * mask).sum(axis=0)
+    slope = (
+        centered_time * (values - mean[None, :]) * mask
+    ).sum(axis=0) / np.where(slope_denominator > 1e-8, slope_denominator, 1.0)
+    slope[slope_denominator <= 1e-8] = np.nan
+    last_observation = float(times[-1])
+    per_variable = np.stack([
+        mean,
+        std,
+        minimum,
+        maximum,
+        first,
+        last,
+        np.log1p(count),
+        count / max(len(times), 1),
+        slope,
+        first_time,
+        last_observation - last_time,
+    ], axis=-1).reshape(-1)
+    global_values = np.asarray([
+        np.log1p(len(times)),
+        last_observation,
+        np.log1p(mask.sum()),
+        mask.mean(),
+    ], dtype=np.float64)
+    if static.size >= 9:
+        static = static[[0, 2, 3, 8, 4, 5, 6, 7]]
+    return np.concatenate([per_variable, global_values, static]).astype(np.float32)
+
+
 class PreparedSplit(Dataset):
-    """Read one already-prepared split without dataset-specific processing.
-
-    Each split is an NPZ file with padded arrays:
-    ``times [N,T]``, ``values [N,T,37]``, ``mask [N,T,37]``,
-    ``lengths [N]``, ``labels [N]``, ``static [N,9]``, and
-    ``summary [N,419]``. Optional ``ids [N]`` defaults to row indices.
-    """
-
     def __init__(self, path):
         self.path = Path(path)
         arrays = np.load(self.path, allow_pickle=False)
-        required = {"times", "values", "mask", "lengths", "labels", "static", "summary"}
+        required = {"times", "values", "mask", "lengths", "labels"}
         missing = sorted(required.difference(arrays.files))
         if missing:
             raise ValueError(f"{self.path} is missing arrays: {', '.join(missing)}")
@@ -26,22 +72,53 @@ class PreparedSplit(Dataset):
         self.mask = np.asarray(arrays["mask"], dtype=np.float32)
         self.lengths = np.asarray(arrays["lengths"], dtype=np.int64)
         self.labels = np.asarray(arrays["labels"], dtype=np.float32).reshape(-1)
-        self.static = np.asarray(arrays["static"], dtype=np.float32)
-        self.summary = np.asarray(arrays["summary"], dtype=np.float32)
+        self.static = np.asarray(
+            arrays["static"] if "static" in arrays.files else
+            np.empty((len(self.labels), 0)),
+            dtype=np.float32,
+        )
         self.ids = np.asarray(
             arrays["ids"] if "ids" in arrays.files else np.arange(len(self.labels)),
             dtype=np.int64,
         )
         if self.values.ndim != 3 or self.values.shape != self.mask.shape:
-            raise ValueError("values and mask must both have shape [N,T,V]")
+            raise ValueError("values and mask must have shape [N,T,V]")
         if self.times.shape != self.values.shape[:2]:
             raise ValueError("times must have shape [N,T]")
-        if self.values.shape[-1] != 37:
-            raise ValueError("the focused release expects 37 dynamic variables")
-        if self.static.shape != (len(self.labels), 9):
-            raise ValueError("static must have shape [N,9]")
-        if self.summary.shape != (len(self.labels), 419):
-            raise ValueError("summary must have shape [N,419]")
+        if self.lengths.shape != (len(self.labels),):
+            raise ValueError("lengths must have shape [N]")
+        if self.static.ndim != 2 or self.static.shape[0] != len(self.labels):
+            raise ValueError("static must have shape [N,S]")
+        if "summary" in arrays.files:
+            self.summary = np.asarray(arrays["summary"], dtype=np.float32)
+        else:
+            raw_values = np.asarray(
+                arrays["raw_values"] if "raw_values" in arrays.files else self.values,
+                dtype=np.float64,
+            )
+            raw_times = np.asarray(
+                arrays["raw_times"] if "raw_times" in arrays.files else self.times,
+                dtype=np.float64,
+            )
+            self.summary = np.stack([
+                _features(
+                    raw_values[index, :int(self.lengths[index])],
+                    self.mask[index, :int(self.lengths[index])],
+                    raw_times[index, :int(self.lengths[index])],
+                    self.static[index].astype(np.float64),
+                )
+                for index in range(len(self.labels))
+            ])
+        if self.summary.ndim != 2 or self.summary.shape[0] != len(self.labels):
+            raise ValueError("summary must have shape [N,F]")
+
+    @property
+    def variable_num(self):
+        return int(self.values.shape[-1])
+
+    @property
+    def static_dim(self):
+        return int(self.static.shape[-1])
 
     def __len__(self):
         return len(self.labels)

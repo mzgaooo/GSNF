@@ -11,13 +11,6 @@ from model.components import Z_to_mu_ReLU, Z_to_std_ReLU
 
 
 class SegmentGraphPosterior(nn.Module):
-    """Segment-level graph posterior used by GSNF.
-
-    Segment observations and missingness summaries parameterize graph
-    posteriors. A sampled graph is used per encoder segment, while a pooled
-    graph is used by the decoder trajectory.
-    """
-
     def __init__(
             self,
             nodes,
@@ -119,7 +112,6 @@ class SegmentGraphPosterior(nn.Module):
         return global_adj, global_kl.mean(dim=(1, 2))
 
     def forward(self, x, mask, times=None):
-        # x/mask: [B, T, N]
         if x.size(-1) != self.nodes:
             raise ValueError(
                 f"Graph posterior expected {self.nodes} nodes, got {x.size(-1)}")
